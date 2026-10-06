@@ -2245,6 +2245,9 @@ local DefaultSettings = {
     AutoRestart = true,
     AutoTrials = false,
     AutoGold = false,
+    AutoEvo = false,
+    TargetEvo = "All",
+    EvoStrat = "Lose",
     CurrentEvoFarmType = "Coins",
     CurrentEvoGrindState = "Grinding coins...",
     CurrentEvoActiveTower = "Scout",
@@ -2382,17 +2385,6 @@ local function LoadSettings()
         elseif Globals.MultiplayerTargetP2 and #Globals.MultiplayerTargetP2 > 0 then
             Globals.MultiplayerIsHost = true
         end
-    end
-
-    -- Standalone Auto Evo was removed. Evolution remains available internally
-    -- through Trials > Progression Mode > Auto Farm & Buy Missing Evolutions.
-    Globals.AutoEvo = false
-    Globals.TargetEvo = "All"
-    Globals.EvoStrat = "Lose"
-
-    if not Globals.AutoTrials then
-        Globals.AutoGold = false
-        Globals.AutoEvo = false
     end
 
     SaveSettings(true)
@@ -3013,10 +3005,10 @@ local function snapshotMatchConfig()
 
                     if coinsNeed > 0 then
                         startStage = "Coins"
-                    elseif gemsNeed > 0 then
-                        startStage = "Gems"
                     elseif startBaseLevel < 20 then
                         startStage = "BaseLevel"
+                    elseif gemsNeed > 0 then
+                        startStage = "Gems"
                     else
                         startStage = "ReadyToBuy"
                     end
@@ -3721,10 +3713,25 @@ analyzeAutoEvoRequirements = function(optTargetEvo: string?, optStrat: string?):
 
     if #toCheck == 0 then
         if target == "All" then
-            result.allFinished = true
-            result.configFound = true
-            result.isEligible = false
-            return result
+            local allActuallyComplete = true
+            for _, tName in ipairs({ "Scout", "Shotgunner", "Crook Boss", "Minigunner" }) do
+                if not isTowerEvoComplete(tName) then
+                    allActuallyComplete = false
+                    break
+                end
+            end
+            if allActuallyComplete then
+                result.allFinished = true
+                result.configFound = true
+                result.isEligible = false
+                return result
+            else
+                result.allFinished = false
+                result.configFound = false
+                result.isEligible = false
+                table.insert(result.missingParts, "Loading tower data...")
+                return result
+            end
         else
             table.insert(result.missingParts, "No Target Selected")
             return result
@@ -3771,12 +3778,14 @@ analyzeAutoEvoRequirements = function(optTargetEvo: string?, optStrat: string?):
 
                 if not activeTower then
                     activeTower = towerName
-                    if baseLevel < 20 then
-                        -- Must reach Level 20 first! Farms Coins/EXP with this tower
+                    if coinsNeed > 0 then
+                        -- Priority 1: Coins needed -> Farm Coins
                         activeFarmType = "Coins"
-                    elseif coinsNeed > 0 then
-                        activeFarmType = "Coins"
+                    elseif baseLevel < 20 then
+                        -- Priority 2: Level missing (< 20) -> Farm Gems (Hardcore) for faster EXP + gems!
+                        activeFarmType = "Gems"
                     elseif gemsNeed > 0 then
+                        -- Priority 3: Gems needed -> Farm Gems (Hardcore)
                         activeFarmType = "Gems"
                     else
                         activeReadyToBuy = true
@@ -4024,16 +4033,16 @@ local function checkAutoEvoMilestonesReached(): (boolean, string?)
             return true, string.format("%s: Coins Reach (%s / %s Coins)", activeTower, formatNumberWithCommas(coins), formatNumberWithCommas(targetCoins))
         end
         return false, nil
-    elseif gemsNeed > 0 then
-        -- Milestone 3: Gems Reach
-        if gems >= targetGems then
-            return true, string.format("%s: Gems Reach (%s / %s Gems)", activeTower, formatNumberWithCommas(gems), formatNumberWithCommas(targetGems))
-        end
-        return false, nil
     elseif baseLevel < 20 then
         -- Milestone 1: Level reach 20
         if baseLevel >= 20 then
             return true, string.format("%s: Level reach 20 (Base Tower Level %d/20)", activeTower, baseLevel)
+        end
+        return false, nil
+    elseif gemsNeed > 0 then
+        -- Milestone 3: Gems Reach
+        if gems >= targetGems then
+            return true, string.format("%s: Gems Reach (%s / %s Gems)", activeTower, formatNumberWithCommas(gems), formatNumberWithCommas(targetGems))
         end
         return false, nil
     else
@@ -8051,19 +8060,25 @@ local function buildInterface()
 
     local EvoControlSec = AutoEvoTab:Section({ Title = "Evolution Controls" })
 
+    local isInitializingAutoEvo = true
+
     UI.AutoEvoToggle = EvoControlSec:Toggle({
         Title = "Enable Auto Evo",
         Desc = "Automatically evolve selected towers when currency allows",
         IsPrem = isPremiumUser,
         Value = Globals.AutoEvo == true,
         Callback = RunAsExecutor(function(val)
+            if isInitializingAutoEvo then return end
             local evoAnalysis = (typeof(analyzeAutoEvoRequirements) == "function") and analyzeAutoEvoRequirements()
             if val and evoAnalysis and not evoAnalysis.isEligible then
-                if UI.AutoEvoToggle then UI.AutoEvoToggle:SetValue(false) end
-                local desc = (evoAnalysis.missingParts and #evoAnalysis.missingParts > 0) and table.concat(evoAnalysis.missingParts, ", ") or "Requirements not met!"
-                if evoAnalysis.allFinished then desc = "All target evolutions are already complete!" end
-                Window:Notify({ Title = "REQUIREMENT LOCKED", Desc = desc, Duration = 4 })
-                return
+                if evoAnalysis.allFinished then
+                    if UI.AutoEvoToggle then UI.AutoEvoToggle:SetValue(false) end
+                    Window:Notify({ Title = "AUTO EVO COMPLETE", Desc = "All target evolutions are already complete!", Duration = 4 })
+                    return
+                elseif #evoAnalysis.missingParts > 0 and evoAnalysis.missingParts[1] ~= "Loading tower data..." then
+                    local desc = table.concat(evoAnalysis.missingParts, ", ")
+                    Window:Notify({ Title = "REQUIREMENT LOCKED", Desc = desc, Duration = 4 })
+                end
             end
 
             if val then
@@ -8109,6 +8124,10 @@ local function buildInterface()
             task.spawn(function() pcall(refreshDisplay) end)
         end),
     })
+
+    task.defer(function()
+        isInitializingAutoEvo = false
+    end)
 
     EvoControlSec:Dropdown({
         Title = "Target Evo",
@@ -8945,8 +8964,13 @@ refreshDisplay = function()
                                     table.insert(lines, string.format("%s: Needs %s", towerName, table.concat(reqStr, ", ")))
                                     
                                     if not stateFound then
-                                        if coinsNeed > 0 then grindState = "Grinding coins..."
-                                        else grindState = "Grinding gems..." end
+                                        if coinsNeed > 0 then
+                                            grindState = "Grinding coins..."
+                                        elseif expData.Level < 20 then
+                                            grindState = "Grinding level..."
+                                        else
+                                            grindState = "Grinding gems..."
+                                        end
                                         stateFound = true
                                         Globals.CurrentEvoActiveTower = towerName
                                     end
@@ -8964,8 +8988,26 @@ refreshDisplay = function()
             end
             towersText = table.concat(lines, "\n"):gsub("\n$", "")
         else
-            towersText = (selected == "All") and "All Evolutions Complete!" or "(No target selected)"
-            grindState = (selected == "All") and "Idle / Finished" or "No target selected"
+            local allActuallyComplete = true
+            for _, tName in ipairs({ "Scout", "Shotgunner", "Crook Boss", "Minigunner" }) do
+                if not isTowerEvoComplete(tName) then
+                    allActuallyComplete = false
+                    break
+                end
+            end
+            if selected == "All" then
+                if allActuallyComplete then
+                    towersText = "All Evolutions Complete!"
+                    grindState = "Idle / Finished"
+                else
+                    towersText = "Loading evolution data..."
+                    grindState = "Loading data..."
+                end
+            else
+                local isComplete = (EvoData[selected] and isTowerEvoComplete(selected))
+                towersText = isComplete and (selected .. " Evolution Complete!") or "(No target selected)"
+                grindState = isComplete and "Idle / Finished" or "No target selected"
+            end
         end
         
         UI.EvoTowersLabel:SetDesc(towersText)
@@ -10090,6 +10132,9 @@ handleAutoGoldExecution = function()
         end
     elseif Globals.AutoEvo or isAutoEvoMatch then
         local evoAnalysis = analyzeAutoEvoRequirements()
+        if evoAnalysis and #evoAnalysis.missingParts > 0 and evoAnalysis.missingParts[1] == "Loading tower data..." then
+            return
+        end
         if not evoAnalysis.isEligible then
             Globals.AutoEvo = false
             SetSetting("AutoEvo", false)
