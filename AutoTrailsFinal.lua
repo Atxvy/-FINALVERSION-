@@ -2305,8 +2305,12 @@ local function SaveSettings(immediate: boolean?)
             dataToSave[key] = Globals[key]
         end
         if writefile and HttpService then
+            local encoded = HttpService:JSONEncode(dataToSave)
             pcall(function()
-                writefile(SETTINGS_FILE, HttpService:JSONEncode(dataToSave))
+                writefile(SETTINGS_FILE, encoded)
+            end)
+            pcall(function()
+                writefile(CONFIG_FOLDER .. "/user.json", encoded)
             end)
         end
     end
@@ -2321,7 +2325,7 @@ local function SaveSettings(immediate: boolean?)
         if saveDebounceTimer then
             task.cancel(saveDebounceTimer)
         end
-        saveDebounceTimer = task.delay(0.5, function()
+        saveDebounceTimer = task.delay(0.1, function()
             saveDebounceTimer = nil
             executeSave()
         end)
@@ -2333,10 +2337,16 @@ local function LoadSettings()
     local data = {}
     local targetPath = isfile and isfile(SETTINGS_FILE) and SETTINGS_FILE or nil
     if not targetPath and isfile then
-        if isfile("[AT]/" .. SETTINGS_FILE_NAME) then
+        if isfile(CONFIG_FOLDER .. "/user.json") then
+            targetPath = CONFIG_FOLDER .. "/user.json"
+        elseif isfile("[AT]/" .. SETTINGS_FILE_NAME) then
             targetPath = "[AT]/" .. SETTINGS_FILE_NAME
+        elseif isfile("[Trial]/" .. SETTINGS_FILE_NAME) then
+            targetPath = "[Trial]/" .. SETTINGS_FILE_NAME
         elseif isfile("ServiceHub/" .. SETTINGS_FILE_NAME) then
             targetPath = "ServiceHub/" .. SETTINGS_FILE_NAME
+        elseif isfile("user.json") then
+            targetPath = "user.json"
         end
     end
 
@@ -2820,11 +2830,16 @@ local function SetSetting(name: string, value: any)
         if name == "TimeScaleValue" then
             value = CoerceTimeScaleValue(value, Globals.TimeScaleValue or 2)
         end
-        if Globals[name] == value then
-            return
+        if type(value) == "table" then
+            local clone = {}
+            for k, v in pairs(value) do
+                clone[k] = v
+            end
+            Globals[name] = clone
+        else
+            Globals[name] = value
         end
-        Globals[name] = value
-        SaveSettings()
+        SaveSettings(true)
 
         if game.PlaceId ~= LOBBY_PLACE_ID and isMatchConfigDirty and isMatchConfigDirty() then
             if not Globals.IsConfigDirty then
@@ -7726,11 +7741,13 @@ local function buildInterface()
     local farmToggleTitle = isPremiumUser and "Enable Farm Mode" or (isKeyUser and "Enable Auto Trials (Repeat Mode)" or "Enable Auto Trials (Keyless Mode)")
     local farmToggleDesc = isPremiumUser and "Continuously farm selected trials and fallback modes" or (isKeyUser and "Repeats current eligible trials continuously (Key Mode)" or "Farms eligible unowned trials only; waits when already owned (Keyless)")
 
+    local isInitializingFarm = true
     local farmToggle = FarmSec:Toggle({
         Title = farmToggleTitle,
         Desc = farmToggleDesc,
         Value = (Globals.AutoTrials == true and Globals.TrialFarmMode ~= "Progression Mode"),
         Callback = RunAsExecutor(function(val)
+            if isInitializingFarm then return end
             if isRequirementLocked and val then
                 if UI.FarmToggle then UI.FarmToggle:SetValue(false) end
                 Window:Notify({ Title = "REQUIREMENT LOCKED", Desc = "Level/Towers required!", Duration = 4 })
@@ -7786,6 +7803,9 @@ local function buildInterface()
             task.spawn(function() pcall(refreshDisplay) end)
         end)
     })
+    task.defer(function()
+        isInitializingFarm = false
+    end)
     UI.FarmToggle = farmToggle
     UI.AutoToggle = farmToggle
     UI.FarmStatusLabel = FarmSec:Label({ Title = "Status", Desc = "Checking..." })
@@ -7809,9 +7829,22 @@ local function buildInterface()
         Searchable = true,
         Options = trialOptionsList,
         Multi = true,
-        Value = Globals.SelectedTrials or { "Fog" },
+        Value = (function()
+            local c = {}
+            for _, v in ipairs(Globals.SelectedTrials or { "Fog" }) do
+                table.insert(c, v)
+            end
+            return c
+        end)(),
         Callback = function(selectedItems)
-            SetSetting("SelectedTrials", selectedItems)
+            local cleanList = {}
+            if type(selectedItems) == "table" then
+                for _, item in ipairs(selectedItems) do
+                    table.insert(cleanList, item)
+                end
+            end
+            SetSetting("SelectedTrials", cleanList)
+            task.spawn(function() pcall(refreshDisplay) end)
         end,
     })
 
@@ -7883,12 +7916,14 @@ local function buildInterface()
 
     local ProgControlSec = ProgressionTab:Section({ Title = "Progression Controls" })
 
+    local isInitializingProg = true
     local progressionToggle = ProgControlSec:Toggle({
         Title = "Enable Progression Mode",
         Desc = "Prioritizes clearing unowned trials, auto-buying missing towers/skills",
         IsPrem = isPremiumUser,
         Value = (Globals.AutoTrials == true and Globals.TrialFarmMode == "Progression Mode"),
         Callback = RunAsExecutor(function(val)
+            if isInitializingProg then return end
             if val and checkIsEverythingMaxed() then
                 if UI.ProgressionToggle then UI.ProgressionToggle:SetValue(false) end
                 if Window and Window.Notify then
@@ -7953,6 +7988,9 @@ local function buildInterface()
             task.spawn(function() pcall(refreshDisplay) end)
         end)
     })
+    task.defer(function()
+        isInitializingProg = false
+    end)
     UI.ProgressionToggle = progressionToggle
     UI.ProgStatusLabel = ProgControlSec:Label({ Title = "Status", Desc = "Checking..." })
 
