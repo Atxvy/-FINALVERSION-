@@ -3674,7 +3674,14 @@ isTowerEvoComplete = function(towerName: string): boolean
     if PlayerDataHandler and typeof(PlayerDataHandler.IsTowerOwned) == "function" then
         local ownsEvo = false
         pcall(function() ownsEvo = PlayerDataHandler:IsTowerOwned(evoName) end)
-        if ownsEvo then return true end
+        if ownsEvo then
+            local expData = nil
+            if typeof(PlayerDataHandler.GetTowerExp) == "function" then
+                pcall(function() expData = PlayerDataHandler:GetTowerExp(evoName) end)
+            end
+            local evoLevel = (expData and type(expData.Level) == "number") and expData.Level or 0
+            return evoLevel >= 20
+        end
     end
     return false
 end
@@ -4674,24 +4681,125 @@ local function shouldSwitchToUnownedTrial(): boolean
     return true
 end
 
-local function fireSkipVoteUntilTrue(): boolean
-    local Event = game:GetService("ReplicatedStorage"):FindFirstChild("RemoteFunction")
-    if not Event then return false end
-
-    local success, result = pcall(function()
-        local Result = table.pack(Event:InvokeServer(
-            "Voting",
-            "Skip"
-        ))
-
-        local ExpectedResult = table.unpack({
-            true
-        })
-
-        return Result[1] == ExpectedResult
+local function triggerRematchVote(): boolean
+    local fired = false
+    -- 1. Fire GameManager RE:Rematch
+    pcall(function()
+        local gm = ReplicatedStorage:FindFirstChild("Network") and ReplicatedStorage.Network:FindFirstChild("GameManager")
+        local reMatch = gm and gm:FindFirstChild("RE:Rematch")
+        if reMatch and reMatch:IsA("RemoteEvent") then
+            reMatch:FireServer()
+            fired = true
+        end
     end)
 
-    return success and (result == true)
+    -- 2. Click PlayAgain / Retry / Restart button in ReactGameNewRewards or any game over GUI
+    pcall(function()
+        local gui = PlayerGui:FindFirstChild("ReactGameNewRewards")
+            or PlayerGui:FindFirstChild("GameOver")
+            or PlayerGui:FindFirstChild("GameOverScreen")
+            or PlayerGui:FindFirstChild("ReactGameOver")
+        if gui then
+            local candidateNames = { "PlayAgain", "Retry", "Restart", "Rematch" }
+            for _, cName in ipairs(candidateNames) do
+                local elem = gui:FindFirstChild(cName, true)
+                if elem then
+                    local btn = elem:FindFirstChild("button")
+                        or elem:FindFirstChildOfClass("ImageButton")
+                        or elem:FindFirstChildOfClass("TextButton")
+                        or (elem:IsA("GuiButton") and elem)
+                    if btn and getconnections then
+                        for _, conn in ipairs(getconnections(btn.Activated)) do conn:Fire(); fired = true end
+                        for _, conn in ipairs(getconnections(btn.MouseButton1Click)) do conn:Fire(); fired = true end
+                    end
+                end
+            end
+        end
+    end)
+
+    -- Also scan ScreenGuis for any button labeled with Retry, Restart, Play Again, or Rematch
+    pcall(function()
+        for _, gui in ipairs(PlayerGui:GetChildren()) do
+            if gui:IsA("ScreenGui") and gui.Enabled then
+                for _, desc in ipairs(gui:GetDescendants()) do
+                    if desc:IsA("TextButton") then
+                        local txt = desc.Text:lower()
+                        if txt:find("retry") or txt:find("restart") or txt:find("play again") or txt:find("rematch") then
+                            if getconnections then
+                                for _, conn in ipairs(getconnections(desc.Activated)) do conn:Fire(); fired = true end
+                                for _, conn in ipairs(getconnections(desc.MouseButton1Click)) do conn:Fire(); fired = true end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
+    -- 3. Invoke RemoteFunction voting commands
+    pcall(function()
+        local rf = ReplicatedStorage:FindFirstChild("RemoteFunction")
+        if rf then
+            pcall(function() rf:InvokeServer("Voting", "Retry") end)
+            pcall(function() rf:InvokeServer("Voting", "Restart") end)
+            pcall(function() rf:InvokeServer("Voting", "Rematch") end)
+            pcall(function() rf:InvokeServer("Voting", "Skip") end)
+            fired = true
+        end
+    end)
+
+    return fired
+end
+
+local function fireSkipVoteUntilTrue(): boolean
+    local fired = triggerRematchVote()
+    return fired
+end
+
+local function shouldRetryAutoEvoLoss(status: string): boolean
+    if status ~= "LOSS" then
+        return false
+    end
+
+    local isEvoActive = (Globals.AutoEvo == true) or (currentMatchMode == "AutoEvo")
+    if not isEvoActive then
+        local savedMode = (typeof(loadActiveMode) == "function") and loadActiveMode() or ""
+        if savedMode == "AutoEvo" then
+            isEvoActive = true
+        end
+    end
+    if not isEvoActive then
+        return false
+    end
+
+    -- Determine if this Auto Evo match is running a Lose strategy:
+    local usesLoseStrategy = false
+    local evoStratLower = tostring(Globals.EvoStrat or "Lose"):lower()
+    local stratLower = tostring(Globals.Strat or ""):lower()
+    local farmTypeLower = tostring(Globals.CurrentEvoFarmType or Globals.AutoFarmType or ""):lower()
+
+    if evoStratLower == "lose" or stratLower == "lose" or farmTypeLower == "gems" then
+        usesLoseStrategy = true
+    elseif typeof(isGemsLoseMatch) == "function" and isGemsLoseMatch() then
+        usesLoseStrategy = true
+    elseif typeof(analyzeAutoEvoRequirements) == "function" then
+        local ok, analysis = pcall(analyzeAutoEvoRequirements)
+        if ok and analysis and (tostring(analysis.stratChoice or ""):lower() == "lose" or tostring(analysis.farmType or ""):lower() == "gems") then
+            usesLoseStrategy = true
+        end
+    end
+
+    if not usesLoseStrategy then
+        return false
+    end
+
+    local reachedMilestone = false
+    if typeof(checkAutoEvoMilestonesReached) == "function" then
+        local ok, reached = pcall(checkAutoEvoMilestonesReached)
+        reachedMilestone = ok and (reached == true)
+    end
+
+    return not reachedMilestone
 end
 
 local function isGemsLoseMatch(): boolean
@@ -4913,6 +5021,13 @@ local function checkShouldExitGemsLose(): (boolean, string?)
 end
 
 local function shouldTeleportOnMatchEnd(status: string): boolean
+    -- 0. Auto Evo Lose priority check: If Auto Evo Lose is active and milestone is NOT reached, NEVER SMART LOBBY!
+    if shouldRetryAutoEvoLoss(status) then
+        logActivity("[AutoEvo Lose] Milestone not reached; staying in-game to vote retry & re-execute strategy.", "info")
+        warn("[ServiceHub AutoEvo] Match ended (LOSS) -> Auto Evo milestone not reached. Initiating in-game retry without SmartLobby.")
+        return false
+    end
+
     local mode = currentMatchMode or loadActiveMode()
     if not mode or mode == "" then
         if Globals.AutoEvo and not Globals.AutoGold and not Globals.AutoTrials then
@@ -5113,7 +5228,7 @@ local function shouldTeleportOnMatchEnd(status: string): boolean
         end
 
         -- IF LOSE strat on LOSS: it should NOT SMART lobby !! instead it will just RETRY until target reached!
-        if (Globals.Strat == "Lose" or isGemsLoseMatch()) and status == "LOSS" then
+        if (Globals.Strat == "Lose" or Globals.EvoStrat == "Lose" or Globals.CurrentEvoFarmType == "Gems" or isGemsLoseMatch() or shouldRetryAutoEvoLoss(status)) and status == "LOSS" then
             return false
         end
 
@@ -5185,7 +5300,7 @@ local function shouldTeleportOnMatchEnd(status: string): boolean
         if Globals.CurrentEvoFarmType == "Gems" and stratChoice == "Win" then stratChoice = "Lose" end
 
         -- IF LOSE strat on LOSS: it should NOT SMART lobby !! instead it will just RETRY until target reached!
-        if (stratChoice == "Lose" or isGemsLoseMatch()) and status == "LOSS" then
+        if (stratChoice == "Lose" or Globals.Strat == "Lose" or Globals.CurrentEvoFarmType == "Gems" or isGemsLoseMatch() or shouldRetryAutoEvoLoss(status)) and status == "LOSS" then
             return false
         end
 
@@ -6292,7 +6407,7 @@ local function runMatchStrategyIfSaved()
                                 local startVoteTime = tick()
                                 while isRunning and (tick() - startVoteTime < 30) do
                                     if GetMatchStatus() == nil then break end
-                                    fireSkipVoteUntilTrue()
+                                    triggerRematchVote()
                                     task.wait(0.5)
                                 end
                             end)
@@ -6310,12 +6425,20 @@ local function runMatchStrategyIfSaved()
                                     restartSuccess = true
                                     break
                                 end
-                                task.wait(1)
+                                triggerRematchVote()
+                                task.wait(0.5)
                             end
 
                             if not restartSuccess then
-                                SmartTeleportToLobby()
-                                break
+                                if shouldRetryAutoEvoLoss(status) then
+                                    warn("[ServiceHub] Auto-Restart timed out on Auto Evo Loss; retrying in-place without SmartLobby.")
+                                    triggerRematchVote()
+                                    isHandlingEndMatch = false
+                                    task.wait(2)
+                                else
+                                    SmartTeleportToLobby()
+                                    break
+                                end
                             end
 
                             task.wait(2) -- Buffer to allow map models to fully render
@@ -10280,7 +10403,7 @@ handleAutoGoldExecution = function()
                         local startVoteTime = tick()
                         while isRunning and (tick() - startVoteTime < 30) do
                             if GetMatchStatus() == nil then break end
-                            fireSkipVoteUntilTrue()
+                            triggerRematchVote()
                             task.wait(0.5)
                         end
                     end)
@@ -10293,14 +10416,22 @@ handleAutoGoldExecution = function()
                             restartSuccess = true
                             break
                         end
+                        triggerRematchVote()
                         task.wait(0.5)
                     end
 
                     if not restartSuccess then
-                        warn("[ServiceHub] Auto-Restart timed out waiting for rewards screen to close. Returning to lobby.")
-                        SmartTeleportToLobby()
-                        autoGoldWatcherRunning = false
-                        return
+                        if shouldRetryAutoEvoLoss(currentStatus) or (isAutoEvoMatch and (Globals.EvoStrat == "Lose" or Globals.CurrentEvoFarmType == "Gems" or isGemsLoseMatch())) then
+                            warn("[ServiceHub AutoEvo] Rematch transition timed out; retrying rematch vote in-place without SmartLobby.")
+                            triggerRematchVote()
+                            isHandlingEndMatch = false
+                            task.wait(2)
+                        else
+                            warn("[ServiceHub] Auto-Restart timed out waiting for rewards screen to close. Returning to lobby.")
+                            SmartTeleportToLobby()
+                            autoGoldWatcherRunning = false
+                            return
+                        end
                     end
 
                     local stateReps = ReplicatedStorage:WaitForChild("StateReplicators", 5)
@@ -10828,20 +10959,25 @@ if game.PlaceId ~= LOBBY_PLACE_ID then
             if (currentStatus == "LOSS" or currentStatus == "WIN") and not isHandlingEndMatch then
                 -- Only supervise if mode watchers are NOT actively running
                 if not autoGoldWatcherRunning and not trialWatcherRunning then
-                    local evoMilestone, evoReason = false, nil
-                    if Globals.AutoEvo then
-                        pcall(function()
-                            evoMilestone, evoReason = checkAutoEvoMilestonesReached()
-                        end)
-                    end
-                    if Globals.IsConfigDirty or Globals.AutoEvoMilestoneReached or evoMilestone or (isMatchConfigDirty and isMatchConfigDirty()) then
-                        isHandlingEndMatch = true
-                        if activeStratThread and coroutine.status(activeStratThread) ~= "dead" then
-                            pcall(task.cancel, activeStratThread)
-                            activeStratThread = nil
+                    if (Globals.AutoEvo or currentMatchMode == "AutoEvo") and currentStatus == "LOSS" and shouldRetryAutoEvoLoss(currentStatus) then
+                        warn("[ServiceHub Supervisor] Watchers idle on LOSS, but Auto Evo Lose retry is active. Launching handleAutoGoldExecution.")
+                        task.spawn(handleAutoGoldExecution)
+                    else
+                        local evoMilestone, evoReason = false, nil
+                        if Globals.AutoEvo then
+                            pcall(function()
+                                evoMilestone, evoReason = checkAutoEvoMilestonesReached()
+                            end)
                         end
-                        shouldTeleportOnMatchEnd(currentStatus)
-                        break
+                        if Globals.IsConfigDirty or Globals.AutoEvoMilestoneReached or evoMilestone or (isMatchConfigDirty and isMatchConfigDirty()) then
+                            isHandlingEndMatch = true
+                            if activeStratThread and coroutine.status(activeStratThread) ~= "dead" then
+                                pcall(task.cancel, activeStratThread)
+                                activeStratThread = nil
+                            end
+                            shouldTeleportOnMatchEnd(currentStatus)
+                            break
+                        end
                     end
                 end
             end
